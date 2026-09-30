@@ -1,0 +1,27 @@
+# 依赖与构建产物
+node_modules/
+webui/dist/
+**/bin/
+**/obj/
+core/**/__pycache__/
+*.pyc
+
+# 运行时数据
+data/monitoring/
+data/summaries/
+data/exports/
+data/logs/
+data/roster/*.jpg
+data/roster/*.jpeg
+data/roster/*.png
+config.json
+
+# 系统与编辑器
+.DS_Store
+Thumbs.db
+*.user
+
+# 密钥与令牌
+*.pem
+tunnel_token.txt
+tools/*.tmp

@@ -1,128 +1,115 @@
 using System.Diagnostics;
-using System.Net.Sockets;
 using System.Text;
-using System.Text.Json;
+using System.Windows.Forms;
 
 namespace AssistantTray;
 
-/// <summary>
-/// 系统托盘：开机静默常驻，守护核心/桥进程，右键菜单，关机导出拦截。
-/// </summary>
+/// <summary>托盘入口：单实例 + 常驻。</summary>
 internal static class Program
 {
-    private static string _root = "";
-    private static int _corePort = 18760;
-    private static Process? _coreProc;
-    private static Process? _bridgeProc;
-    private static Form? _panel;
-    private static NotifyIcon _tray = null!;
-    private static DateTime _lastExport = DateTime.MinValue;
-
     [STAThread]
     private static void Main()
     {
-        using var mutex = new Mutex(true, "AssistantTray.SingleInstance", out var createdNew);
-        if (!createdNew) return;
-        Application.SetHighDpiMode(HighDpiMode.SystemAware);
-        Application.EnableVisualStyles();
-        Application.SetCompatibleTextRenderingDefault(false);
-
-        _root = FindProjectRoot();
-        if (string.IsNullOrEmpty(_root))
+        using var mutex = new Mutex(true, "AI_Classroom_Assistant_Tray", out var createdNew);
+        if (!createdNew)
         {
-            MessageBox.Show("未找到项目目录（AI课堂助手）", "AI 课堂助手",
-                MessageBoxButtons.OK, MessageBoxIcon.Error);
+            // 已有一个托盘实例，静默退出（v1 教训：避免多实例自愈打架）
             return;
         }
-
-        _tray = BuildTray();
-        _corePort = FindCorePort();
-        GuardLoop();          // 后台守护：核心/桥 不在就拉起
-
-        Application.Run();
+        Application.EnableVisualStyles();
+        Application.SetCompatibleTextRenderingDefault(false);
+        Application.Run(new TrayContext());
     }
+}
 
-    private static string FindProjectRoot()
+/// <summary>托盘上下文：图标、菜单、进程守护（核心 + 桥）。</summary>
+internal class TrayContext : ApplicationContext
+{
+    private readonly NotifyIcon _tray;
+    private readonly ToolStripMenuItem _miAutoStart;
+    private readonly string _root = ResolveRoot();
+    private Process? _coreProc;
+    private Process? _bridgeProc;
+    private PanelForm? _panel;
+    private readonly System.Threading.Timer _guardTimer;
+    private int _corePort = 18760;
+
+    /// <summary>从可执行目录向上查找项目根（兼容 bin/publish 两种布局）。</summary>
+    internal static string ResolveRoot()
     {
         var dir = new DirectoryInfo(AppContext.BaseDirectory);
-        for (var i = 0; i < 6; i++)
+        for (var i = 0; i < 8 && dir is not null; i++)
         {
-            if (dir != null && Directory.Exists(Path.Combine(dir.FullName, "core")) &&
-                Directory.Exists(Path.Combine(dir.FullName, "data")))
+            if (File.Exists(Path.Combine(dir.FullName, "core", "main.py")))
                 return dir.FullName;
-            dir = dir?.Parent;
+            dir = dir.Parent;
         }
-        return "";
+        return Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", ".."));
     }
 
-    private static NotifyIcon BuildTray()
+    public TrayContext()
     {
-        var icon = LoadIcon();
-        var tray = new NotifyIcon
+        _tray = new NotifyIcon
         {
-            Icon = icon,
-            Text = "AI 课堂助手（监听 ClassIsland）",
+            Icon = LoadIcon(),
+            Text = "AI 课堂助手",
             Visible = true,
         };
+
+        // 关机拦截：先导出监控/总结，再放行系统关机
+        Microsoft.Win32.SystemEvents.SessionEnding += OnSessionEnding;
+
         var menu = new ContextMenuStrip();
-        menu.Items.Add("📊 打开控制台", null, (_, _) => OpenPanel());
-        menu.Items.Add("🖥 打开面板", null, (_, _) => OpenPanel("panel.html"));
+        _miAutoStart = new ToolStripMenuItem("开机自启：开", null, OnToggleAutoStart);
+        menu.Items.Add(new ToolStripMenuItem("打开面板", null, OnOpenPanel));
+        menu.Items.Add(new ToolStripMenuItem("打开控制台", null, (_, _) => OpenBrowser()));
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add("🔄 重启核心", null, (_, _) => RestartCore());
-        menu.Items.Add("💾 立即导出", null, (_, _) => ExportNow());
+        menu.Items.Add(_miAutoStart);
+        menu.Items.Add(new ToolStripMenuItem("重启核心", null, (_, _) => RestartCore()));
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add("⚙ 开机自启", null, (_, _) => ToggleAutostart());
-        menu.Items.Add("❌ 退出", null, (_, _) => ExitApp());
-        tray.ContextMenuStrip = menu;
-        tray.DoubleClick += (_, _) => OpenPanel();
-        return tray;
+        menu.Items.Add(new ToolStripMenuItem("退出", null, OnExit));
+        _tray.ContextMenuStrip = menu;
+        _tray.DoubleClick += (_, _) => OnOpenPanel(menu, EventArgs.Empty);
+
+        // 启动守护
+        _guardTimer = new System.Threading.Timer(_ => GuardLoop(), null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(5));
+        _ = Task.Run(Bootstrap);
     }
 
-    private static Icon LoadIcon()
+    /// <summary>启动核心与桥（后台，不阻塞 UI）。</summary>
+    private async Task Bootstrap()
     {
-        var ico = Path.Combine(_root, "icons", "app.ico");
-        if (File.Exists(ico)) return new Icon(ico);
-        return SystemIcons.Application;
-    }
-
-    private static void GuardLoop()
-    {
-        var t = new Thread(() =>
+        // 1) 核心：找正在监听的端口；没有则拉起新核心到 18760
+        _corePort = FindCorePort();
+        if (_corePort == 0)
         {
-            while (true)
-            {
-                try
-                {
-                    if (!PortInUse(_corePort))
-                        _coreProc = StartCore();
-                    if (_bridgeProc == null || _bridgeProc.HasExited)
-                        _bridgeProc = StartBridge();
-                }
-                catch { /* 守护循环不中断 */ }
-                Thread.Sleep(5000);
-            }
-        });
-        t.IsBackground = true;
-        t.Start();
-    }
-
-    private static int FindCorePort()
-    {
-        for (var p = 18760; p <= 18779; p++)
-        {
-            if (PortInUse(p)) return p;
+            _corePort = 18760;
+            _coreProc = StartCore();
+            await WaitPortAsync(_corePort, 30);
         }
-        return 18760;
+        // 2) 桥：ClassIsland 启用时拉起
+        _bridgeProc = StartBridge();
+        // 3) 刷新自启菜单状态
+        UpdateAutoStartMenu();
     }
 
-    private static bool PortInUse(int port)
+    private void GuardLoop()
     {
-        using var c = new TcpClient();
-        try { c.Connect("127.0.0.1", port); return true; }
-        catch { return false; }
+        try
+        {
+            if (_coreProc is { HasExited: true } || (_coreProc is null && !PortInUse(_corePort)))
+            {
+                _coreProc = StartCore();
+            }
+            if (_bridgeProc is { HasExited: true })
+            {
+                _bridgeProc = StartBridge();
+            }
+        }
+        catch { /* 守护失败静默，下轮重试 */ }
     }
 
-    private static Process? StartCore()
+    private Process? StartCore()
     {
         try
         {
@@ -170,17 +157,17 @@ internal static class Program
         catch { return null; }
     }
 
-    private static Process? StartBridge()
+    private Process? StartBridge()
     {
         try
         {
-            var exe = Path.Combine(_root, "bridge", "ClassIslandBridge", "bin", "Release",
-                "net8.0-windows", "ClassIslandBridge.exe");
-            if (!File.Exists(exe)) return null;
+            var bridgeExe = Path.Combine(_root, "bridge", "ClassIslandBridge", "bin",
+                "Release", "net8.0-windows", "ClassIslandBridge.exe");
+            if (!File.Exists(bridgeExe)) return null;
             var psi = new ProcessStartInfo
             {
-                FileName = exe,
-                WorkingDirectory = Path.GetDirectoryName(exe)!,
+                FileName = bridgeExe,
+                WorkingDirectory = Path.GetDirectoryName(bridgeExe)!,
                 WindowStyle = ProcessWindowStyle.Hidden,
                 CreateNoWindow = true,
                 UseShellExecute = false,
@@ -190,106 +177,125 @@ internal static class Program
         catch { return null; }
     }
 
-    private static void OpenPanel(string page = "")
+    private void RestartCore()
     {
-        try
-        {
-            var url = $"http://127.0.0.1:{_corePort}/{page}";
-            if (_panel is null || _panel.IsDisposed)
-            {
-                _panel = new PanelForm(url);
-                _panel.FormClosed += (_, _) => _panel = null;
-                _panel.Show();
-            }
-            else
-            {
-                _panel.Activate();
-            }
-        }
-        catch { Process.Start("http://127.0.0.1:" + _corePort + "/"); }
-    }
-
-    private static void RestartCore()
-    {
-        if (_coreProc != null)
-        {
-            try { _coreProc.Kill(); } catch { }
-        }
-        foreach (var p in Process.GetProcessesByName("pythonw"))
-        {
-            try { if (p.MainWindowTitle.Length == 0 && p.PathContains(_root)) p.Kill(); } catch { }
-        }
+        try { _coreProc?.Kill(); } catch { }
         _coreProc = StartCore();
     }
 
-    private static void ExportNow()
+    private void OnOpenPanel(object? sender, EventArgs e)
     {
-        if ((DateTime.Now - _lastExport).TotalSeconds < 20) return;
-        _lastExport = DateTime.Now;
-        var t = new Thread(() =>
+        if (_panel is { IsDisposed: false })
         {
-            try
-            {
-                using var c = new HttpClient();
-                var resp = c.PostAsync($"http://127.0.0.1:{_corePort}/api/monitor/export", null).Result;
-                resp.EnsureSuccessStatusCode();
-                _tray.ShowBalloonTip(3000, "AI 课堂助手", "导出完成（监控+总结+座位表）", ToolTipIcon.Info);
-            }
-            catch (Exception ex)
-            {
-                _tray.ShowBalloonTip(3000, "AI 课堂助手", $"导出失败: {ex.Message}", ToolTipIcon.Error);
-            }
-        });
-        t.IsBackground = true;
-        t.Start();
+            _panel.Show();
+            _panel.Activate();
+            return;
+        }
+        _panel = new PanelForm(_corePort);
+        _panel.Closed += (_, _) => _panel = null;
+        _panel.Show();
     }
 
-    private static void ToggleAutostart()
+    private void OpenBrowser()
     {
-        try
-        {
-            var startup = Environment.GetFolderPath(Environment.SpecialFolder.Startup);
-            var lnk = Path.Combine(startup, "AI课堂助手.lnk");
-            if (File.Exists(lnk))
-            {
-                File.Delete(lnk);
-                _tray.ShowBalloonTip(2000, "AI 课堂助手", "已关闭开机自启", ToolTipIcon.Info);
-            }
-            else
-            {
-                var ws = new COMObject("WScript.Shell");
-                var shortcut = ws.CreateShortcut(lnk);
-                shortcut.TargetPath = Environment.ProcessPath!;
-                shortcut.WorkingDirectory = AppContext.BaseDirectory;
-                shortcut.Save();
-                _tray.ShowBalloonTip(2000, "AI 课堂助手", "已开启开机自启", ToolTipIcon.Info);
-            }
-        }
-        catch (Exception ex)
-        {
-            _tray.ShowBalloonTip(2000, "AI 课堂助手", $"自启设置失败: {ex.Message}", ToolTipIcon.Error);
-        }
+        try { Process.Start(new ProcessStartInfo($"http://127.0.0.1:{_corePort}/") { UseShellExecute = true }); }
+        catch { }
     }
 
-    private static void ExitApp()
+    private void OnToggleAutoStart(object? sender, EventArgs e)
     {
-        ExportNow();
+        var startMenuPath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.Startup), "AI课堂助手.lnk");
+        if (File.Exists(startMenuPath))
+        {
+            try { File.Delete(startMenuPath); } catch { }
+        }
+        else
+        {
+            var trayExe = Path.Combine(AppContext.BaseDirectory, "AssistantTray.exe");
+            if (File.Exists(trayExe)) CreateShortcut(startMenuPath, trayExe);
+        }
+        UpdateAutoStartMenu();
+    }
+
+    private void UpdateAutoStartMenu()
+    {
+        var startMenuPath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.Startup), "AI课堂助手.lnk");
+        _miAutoStart.Text = File.Exists(startMenuPath) ? "开机自启：关" : "开机自启：开";
+    }
+
+    private void OnExit(object? sender, EventArgs e)
+    {
+        _guardTimer.Dispose();
         _tray.Visible = false;
-        _tray.Dispose();
-        _panel?.Close();
+        Microsoft.Win32.SystemEvents.SessionEnding -= OnSessionEnding;
+        try { _coreProc?.Kill(); } catch { }
+        try { _bridgeProc?.Kill(); } catch { }
         Application.Exit();
     }
 
-    private static COMObject COMObject(string progId)
+    /// <summary>系统关机/注销前：调用核心导出接口（最多等待 25 秒），然后放行。</summary>
+    private void OnSessionEnding(object sender, Microsoft.Win32.SessionEndingEventArgs e)
     {
-        var t = Type.GetTypeFromProgID(progId)!;
-        return new COMObject(Activator.CreateInstance(t)!);
+        try
+        {
+            using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(25) };
+            _ = http.PostAsync($"http://127.0.0.1:{_corePort}/api/monitor/export", null).Result;
+        }
+        catch { /* 核心未运行则不阻塞关机 */ }
+        e.Cancel = false;   // 完成导出后放行关机
     }
-}
 
-internal class COMObject
-{
-    private readonly object _obj;
-    public COMObject(object obj) => _obj = obj;
-    public dynamic CreateShortcut(string path) => ((dynamic)_obj).CreateShortcut(path);
+    private static Icon LoadIcon()
+    {
+        var ico = Path.Combine(ResolveRoot(), "icons", "app.ico");
+        if (File.Exists(ico)) return new Icon(ico);
+        return SystemIcons.Application;
+    }
+
+    private static void CreateShortcut(string linkPath, string target)
+    {
+        var workDir = Path.GetDirectoryName(target)!.Replace("'", "''");
+        var script = $"$ws = New-Object -ComObject WScript.Shell; $lnk = $ws.CreateShortcut('{linkPath.Replace("'", "''")}'); $lnk.TargetPath = '{target.Replace("'", "''")}'; $lnk.WorkingDirectory = '{workDir}'; $lnk.Description = 'AI 课堂助手（开机自启）'; $lnk.Save()";
+        try
+        {
+            Process.Start(new ProcessStartInfo("powershell",
+                $"-NoProfile -ExecutionPolicy Bypass -Command \"{script}\"")
+            {
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                WindowStyle = ProcessWindowStyle.Hidden,
+            });
+        }
+        catch { }
+    }
+
+    /// <summary>找正在监听的端口（核心所在）；无核心运行返回 0。</summary>
+    private static int FindCorePort()
+    {
+        for (var p = 18760; p < 18780; p++)
+            if (PortInUse(p)) return p;
+        return 0;
+    }
+
+    private static bool PortInUse(int port)
+    {
+        try
+        {
+            using var tcp = new System.Net.Sockets.TcpClient();
+            var task = tcp.ConnectAsync("127.0.0.1", port);
+            return task.Wait(300) && tcp.Connected;
+        }
+        catch { return false; }
+    }
+
+    private static async Task WaitPortAsync(int port, int seconds)
+    {
+        for (var i = 0; i < seconds * 2; i++)
+        {
+            if (PortInUse(port)) return;
+            await Task.Delay(500);
+        }
+    }
 }
